@@ -7,3 +7,4 @@ checkpoints/
 venv/
 .idea/
 wandb/
+training_metrics.xlsx

@@ -6,7 +6,7 @@
 2. 将数据划分为训练集和验证集；
 3. 创建 U-Net、优化器、损失函数和学习率调度器；
 4. 逐批执行前向传播、反向传播和参数更新；
-5. 定期在验证集上计算 Dice 分数；
+5. 每个 epoch 结束后计算 Dice、IoU、Precision、Recall 和 HD95；
 6. 将每轮训练得到的模型权重保存到 ``checkpoints``。
 
 运行示例：
@@ -24,11 +24,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
-
 import wandb
 from evaluate import evaluate
 from unet import UNet
@@ -40,6 +40,74 @@ from utils.dice_score import dice_loss
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
+metrics_file = Path('./training_metrics.xlsx')
+
+
+def create_metrics_workbook(path: Path):
+    """创建新的训练指标工作簿，覆盖同名旧文件。"""
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = 'Training Metrics'
+
+    headers = [
+        'Epoch',
+        'Train Loss',
+        'Dice',
+        'IoU',
+        'Precision',
+        'Recall',
+        'HD95',
+        'Learning Rate',
+    ]
+    worksheet.append(headers)
+
+    header_fill = PatternFill(fill_type='solid', fgColor='1F4E78')
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center')
+
+    column_widths = {
+        'A': 10,
+        'B': 16,
+        'C': 12,
+        'D': 12,
+        'E': 14,
+        'F': 12,
+        'G': 12,
+        'H': 16,
+    }
+    for column, width in column_widths.items():
+        worksheet.column_dimensions[column].width = width
+
+    worksheet.freeze_panes = 'A2'
+    worksheet.auto_filter.ref = 'A1:H1'
+    workbook.save(path)
+    return workbook, worksheet
+
+
+def append_epoch_metrics(workbook, worksheet, path: Path, epoch: int, loss: float, metrics: dict, lr: float):
+    """追加一个 epoch 的汇总指标并立即保存。"""
+
+    worksheet.append([
+        epoch,
+        loss,
+        metrics['dice'],
+        metrics['iou'],
+        metrics['precision'],
+        metrics['recall'],
+        metrics['hd95'],
+        lr,
+    ])
+
+    row = worksheet.max_row
+    worksheet.cell(row, 1).number_format = '0'
+    for column in range(2, 8):
+        worksheet.cell(row, column).number_format = '0.000000'
+    worksheet.cell(row, 8).number_format = '0.00000000E+00'
+    worksheet.auto_filter.ref = f'A1:H{row}'
+    workbook.save(path)
 
 
 def train_model(
@@ -91,8 +159,8 @@ def train_model(
     # num_workers 使用 CPU 核心数并行读取数据；pin_memory 可加快 CPU 到 CUDA 的数据拷贝。
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    # 验证集不需要打乱；丢弃最后一个不足 batch_size 的批次，以保持验证批次形状稳定。
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
+    # 验证集不需要打乱，也不能丢弃最后一个不足 batch_size 的批次。
+    val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **loader_args)
 
     # 初始化 Weights & Biases 实验，用来记录损失、验证指标和模型参数分布。
     # anonymous='must' 允许在没有登录账号时以匿名方式运行。
@@ -101,6 +169,9 @@ def train_model(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
     )
+
+    # 每次启动新训练时覆盖旧指标文件，防止不同实验的数据混在一起。
+    metrics_workbook, metrics_worksheet = create_metrics_workbook(metrics_file)
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -124,115 +195,146 @@ def train_model(
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     # 多分类分割使用交叉熵；单类别前景/背景分割使用二元交叉熵。
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
-    # global_step 记录已处理的训练批次数，用于控制验证频率和日志横轴。
+    # global_step 记录已处理的训练批次数，用作 WandB 日志横轴。
     global_step = 0
 
     # 5. 开始训练。
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
-            for batch in train_loader:
-                # DataLoader 返回字典；图像形状通常为 [N, C, H, W]，
-                # 掩码形状通常为 [N, H, W]。
-                images, true_masks = batch['image'], batch['mask']
+        for batch in train_loader:
+            # DataLoader 返回字典；图像形状通常为 [N, C, H, W]，
+            # 掩码形状通常为 [N, H, W]。
+            images, true_masks = batch['image'], batch['mask']
 
-                # 在训练开始处检查通道数，可尽早发现灰度/RGB 图像配置不匹配的问题。
-                assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+            # 在训练开始处检查通道数，可尽早发现灰度/RGB 图像配置不匹配的问题。
+            assert images.shape[1] == model.n_channels, \
+                f'Network has been defined with {model.n_channels} input channels, ' \
+                f'but loaded images have {images.shape[1]} channels. Please check that ' \
+                'the images are loaded correctly.'
 
-                # channels_last 在部分 GPU 卷积场景下具有更好的内存访问效率。
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                # CrossEntropyLoss 要求类别标签使用整数索引，因此掩码转为 long。
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+            # channels_last 在部分 GPU 卷积场景下具有更好的内存访问效率。
+            images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            # CrossEntropyLoss 要求类别标签使用整数索引，因此掩码转为 long。
+            true_masks = true_masks.to(device=device, dtype=torch.long)
 
-                # autocast 会根据设备自动选择较低精度执行适合的算子，从而减少显存并提升速度。
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    # masks_pred 为未经归一化的 logits。
-                    # 多分类形状为 [N, classes, H, W]；二分类形状为 [N, 1, H, W]。
-                    masks_pred = model(images)
-                    if model.n_classes == 1:
-                        # 单输出通道时去掉通道维，并组合 BCE 与 Dice 损失。
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        # 多分类时，交叉熵直接接收 logits 和类别索引。
-                        loss = criterion(masks_pred, true_masks)
-                        # Dice 损失需要概率图和 one-hot 标签，维度调整为 [N, C, H, W]。
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+            # autocast 会根据设备自动选择较低精度执行适合的算子，从而减少显存并提升速度。
+            with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                # masks_pred 为未经归一化的 logits。
+                # 多分类形状为 [N, classes, H, W]；二分类形状为 [N, 1, H, W]。
+                masks_pred = model(images)
+                if model.n_classes == 1:
+                    # 单输出通道时去掉通道维，并组合 BCE 与 Dice 损失。
+                    loss = criterion(masks_pred.squeeze(1), true_masks.float())
+                    loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                else:
+                    # 多分类时，交叉熵直接接收 logits 和类别索引。
+                    loss = criterion(masks_pred, true_masks)
+                    # Dice 损失需要概率图和 one-hot 标签，维度调整为 [N, C, H, W]。
+                    loss += dice_loss(
+                        F.softmax(masks_pred, dim=1).float(),
+                        F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                        multiclass=True
+                    )
 
-                # set_to_none=True 比把梯度清零更节省内存，并允许 PyTorch 跳过部分无梯度参数。
-                optimizer.zero_grad(set_to_none=True)
-                # AMP 下依次执行：缩放损失、反向传播、还原梯度、裁剪梯度、更新参数。
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+            # set_to_none=True 比把梯度清零更节省内存，并允许 PyTorch 跳过部分无梯度参数。
+            optimizer.zero_grad(set_to_none=True)
+            # AMP 下依次执行：缩放损失、反向传播、还原梯度、裁剪梯度、更新参数。
+            grad_scaler.scale(loss).backward()
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
 
-                # 更新进度条、累计损失和实验日志。
-                pbar.update(images.shape[0])
-                global_step += 1
-                epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
+            global_step += 1
+            # loss 默认是当前批次的均值；乘以批次图片数后累加，便于得到严格的 epoch 样本均值。
+            epoch_loss += loss.item() * images.shape[0]
+            experiment.log({
+                'train loss': loss.item(),
+                'step': global_step,
+                'epoch': epoch
+            })
 
-                # 每个 epoch 大约进行 5 次验证。
-                # 数据量过小时 division_step 可能为 0，此时跳过周期性验证以避免取模错误。
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        # 收集参数和梯度直方图，便于观察参数分布以及梯度消失/爆炸。
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+        average_epoch_loss = epoch_loss / max(n_train, 1)
+        # 每个 epoch 只进行一次完整验证。
+        val_metrics = evaluate(model, val_loader, device, amp, show_progress=False)
+        scheduler.step(val_metrics['dice'])
 
-                        # evaluate 会暂时切换到评估模式，并返回验证集的平均 Dice 分数。
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
+        # 每轮只收集一次参数和梯度直方图。
+        histograms = {}
+        for tag, value in model.named_parameters():
+            tag = tag.replace('/', '.')
+            if not (torch.isinf(value) | torch.isnan(value)).any():
+                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
+            if value.grad is not None and not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        try:
-                            # 除数值指标外，同时上传样例图像、真实掩码和预测掩码。
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms
-                            })
-                        except:
-                            # 可视化日志失败不应中断模型训练。
-                            pass
+        epoch_log = {
+            'epoch average train loss': average_epoch_loss,
+            'learning rate': optimizer.param_groups[0]['lr'],
+            'validation Dice': val_metrics['dice'],
+            'validation IoU': val_metrics['iou'],
+            'validation Precision': val_metrics['precision'],
+            'validation Recall': val_metrics['recall'],
+            'validation HD95': val_metrics['hd95'],
+            'epoch': epoch,
+            'step': global_step,
+            **histograms,
+        }
+        try:
+            pred_example = (
+                (torch.sigmoid(masks_pred).squeeze(1) > 0.5).float()
+                if model.n_classes == 1
+                else masks_pred.argmax(dim=1).float()
+            )
+            epoch_log.update({
+                'images': wandb.Image(images[0].cpu()),
+                'masks': {
+                    'true': wandb.Image(true_masks[0].float().cpu()),
+                    'pred': wandb.Image(pred_example[0].cpu()),
+                },
+            })
+        except Exception:
+            # 可视化日志失败不应中断模型训练。
+            pass
+        experiment.log(epoch_log)
 
         # 每个 epoch 结束后保存 state_dict，而不是整个模型对象，
         # 这样权重文件体积更小，也不依赖保存时的 Python 对象结构。
+        checkpoint_status = 'not saved'
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             # 同时保存掩码中的原始像素值，预测阶段可将类别索引还原为原始颜色/灰度值。
             state_dict['mask_values'] = dataset.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
+            checkpoint_status = 'saved'
+
+        append_epoch_metrics(
+            metrics_workbook,
+            metrics_worksheet,
+            metrics_file,
+            epoch,
+            average_epoch_loss,
+            val_metrics,
+            optimizer.param_groups[0]['lr'],
+        )
+
+        # 每个 epoch 的控制台输出严格合并为一条日志。
+        logging.info(
+            'Epoch %d/%d | loss: %.6f | Dice: %.4f | IoU: %.4f | Precision: %.4f | '
+            'Recall: %.4f | HD95: %.4f | LR: %.8g | checkpoint: %s',
+            epoch,
+            epochs,
+            average_epoch_loss,
+            val_metrics['dice'],
+            val_metrics['iou'],
+            val_metrics['precision'],
+            val_metrics['recall'],
+            val_metrics['hd95'],
+            optimizer.param_groups[0]['lr'],
+            checkpoint_status,
+        )
 
 
 def get_args():
