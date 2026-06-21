@@ -29,6 +29,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
@@ -202,7 +203,12 @@ def train_model(
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
-        for batch in train_loader:
+        train_progress = tqdm(
+            train_loader,
+            desc=f'Epoch {epoch}/{epochs}',
+            unit='batch',
+        )
+        for batch in train_progress:
             # DataLoader 返回字典；图像形状通常为 [N, C, H, W]，
             # 掩码形状通常为 [N, H, W]。
             images, true_masks = batch['image'], batch['mask']
@@ -249,6 +255,7 @@ def train_model(
             global_step += 1
             # loss 默认是当前批次的均值；乘以批次图片数后累加，便于得到严格的 epoch 样本均值。
             epoch_loss += loss.item() * images.shape[0]
+            train_progress.set_postfix(loss=f'{loss.item():.4f}')
             experiment.log({
                 'train loss': loss.item(),
                 'step': global_step,
