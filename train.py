@@ -191,7 +191,13 @@ def train_model(
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     # 当验证 Dice 分数连续若干次没有提高时降低学习率；mode='max' 表示分数越高越好。
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer,
+                            mode='max',
+                            factor=0.5,
+                            patience=7,
+                            min_lr=1e-7
+)    
     # GradScaler 在 AMP 模式下放大损失，减少 float16 梯度下溢；未启用 AMP 时相当于普通训练。
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     # 多分类分割使用交叉熵；单类别前景/背景分割使用二元交叉熵。
@@ -231,8 +237,9 @@ def train_model(
                 masks_pred = model(images)
                 if model.n_classes == 1:
                     # 单输出通道时去掉通道维，并组合 BCE 与 Dice 损失。
-                    loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                    loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                    bce_loss = criterion(masks_pred.squeeze(1),true_masks.float())
+                    d_loss = dice_loss(torch.sigmoid(masks_pred.squeeze(1)),true_masks.float(),multiclass=False)
+                    loss = 0.4 * bce_loss + 0.6 * d_loss
                 else:
                     # 多分类时，交叉熵直接接收 logits 和类别索引。
                     loss = criterion(masks_pred, true_masks)
@@ -348,17 +355,17 @@ def get_args():
     """定义并解析命令行参数。"""
 
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-4,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
+    parser.add_argument('--scale', '-s', type=float, default=1, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
 
     return parser.parse_args()
 
