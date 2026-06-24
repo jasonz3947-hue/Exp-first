@@ -11,7 +11,7 @@
 
 运行示例：
 
-    python test.py --model checkpoints/checkpoint_epoch5.pth
+    python test.py --model checkpoints/checkpoint_epoch104.pth
 """
 
 import argparse
